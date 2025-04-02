@@ -1,0 +1,585 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract PokerGame {
+    address public dealer;
+    uint256 public bigBlind = 0.0002 ether;
+    uint256 public smallBlind = 0.0001 ether;
+    uint256 public maxBet = 0.005 ether;
+    uint256 public entryFee = 0.0001 ether;
+    address public feeReceiver = 0xBB7fB411857E9b993cBD2D812dA689a1DeC85553;
+    uint256 public timeout = 120 seconds;
+
+    address[2] public players;
+    mapping(address => uint256) public balances;
+    uint256 public pot;
+    uint256 public lastActionTime;
+
+    enum GameState { Waiting, Betting, Reveal, Ended }
+    GameState public gameState;
+
+    enum BettingRound { PreFlop, Flop, Turn, River }
+    BettingRound public currentBettingRound;
+
+    struct Player {
+        bool isActive;
+        uint256 betAmount;
+        uint256 handHash;
+        bytes32 commit;
+        uint8[] hand;
+        uint256 seed;
+    }
+
+    mapping(address => Player) public playerInfo;
+    uint8[] public deck;
+    uint8 public deckIndex;
+    uint8[] public communityCards;
+    uint8 public communityCardIndex;
+
+    uint256 public currentBet;
+    address public lastBetter;
+    uint8 public currentPlayer;
+
+    struct SidePot {
+        address[] players;
+        uint256 amount;
+    }
+
+    SidePot[] public sidePots;
+
+    event PlayerJoined(address indexed player);
+    event PlayerBet(address indexed player, uint256 amount);
+    event PlayerRevealed(address indexed player, uint8[] hand);
+    event GameEnded(address indexed winner, uint256 amount);
+
+    constructor() {
+        dealer = msg.sender;
+        gameState = GameState.Waiting;
+        currentBettingRound = BettingRound.PreFlop;
+        resetGame();
+        currentPlayer = 0;
+    }
+
+    modifier checkTimeout() {
+        if (block.timestamp > lastActionTime + timeout) {
+            address winner = players[0] == msg.sender ? players[1] : players[0];
+            endGame(winner);
+        }
+        _;
+    }
+
+    function resetGame() private {
+        delete deck;
+        delete communityCards;
+        deckIndex = 0;
+        communityCardIndex = 0;
+        pot = 0;
+        currentBet = 0;
+        lastBetter = address(0);
+        currentBettingRound = BettingRound.PreFlop;
+        delete sidePots;
+
+        for (uint8 i = 0; i < 52; i++) {
+            deck.push(i);
+        }
+
+        for (uint8 i = 0; i < 2; i++) {
+            playerInfo[players[i]] = Player(false, 0, 0, bytes32(0), new uint8[](0), 0);
+            players[i] = address(0);
+        }
+        gameState = GameState.Waiting;
+    }
+
+    function joinGame(bytes32 commitHash) external payable {
+        require(gameState == GameState.Waiting, "Game already started");
+        require(msg.value >= entryFee, "Entry fee not met");
+        require(players[0] == address(0) || players[1] == address(0), "Table full");
+
+        if (players[0] == address(0)) {
+            players[0] = msg.sender;
+        } else {
+            players[1] = msg.sender;
+        }
+
+        balances[msg.sender] = msg.value - entryFee;
+        pot += entryFee;
+        playerInfo[msg.sender] = Player(true, 0, 0, commitHash, new uint8[](0), 0);
+        lastActionTime = block.timestamp;
+
+        emit PlayerJoined(msg.sender);
+
+        if (players[0] != address(0) && players[1] != address(0)) {
+            shuffleDeck();
+            dealCards();
+            gameState = GameState.Betting;
+        }
+    }
+
+    function shuffleDeck() private {
+        for (uint8 i = 0; i < 52; i++) {
+            uint8 j = uint8(uint256(keccak256(abi.encodePacked(block.timestamp, i))) % 52);
+            (deck[i], deck[j]) = (deck[j], deck[i]);
+        }
+    }
+
+    function dealCards() private {
+        playerInfo[players[currentPlayer]].betAmount += smallBlind;
+        balances[players[currentPlayer]] -= smallBlind;
+        pot += smallBlind;
+        nextPlayer();
+
+        playerInfo[players[currentPlayer]].betAmount += bigBlind;
+        balances[players[currentPlayer]] -= bigBlind;
+        pot += bigBlind;
+        nextPlayer();
+
+        for (uint8 i = 0; i < 2; i++) {
+            playerInfo[players[i]].hand.push(deck[deckIndex++]);
+            playerInfo[players[i]].hand.push(deck[deckIndex++]);
+        }
+        currentBettingRound = BettingRound.PreFlop;
+    }
+
+    function placeBet(uint256 amount) external checkTimeout {
+        require(players[currentPlayer] == msg.sender, "Not your turn");
+        require(playerInfo[msg.sender].isActive, "Not an active player");
+        require(gameState == GameState.Betting, "Not betting phase");
+        require(amount >= currentBet, "Bet too low");
+        require(amount <= balances[msg.sender] && amount <= maxBet, "Invalid bet amount");
+
+        if (amount + playerInfo[msg.sender].betAmount >= balances[msg.sender]) {
+            createSidePot(msg.sender);
+        }
+
+        playerInfo[msg.sender].betAmount += amount;
+        balances[msg.sender] -= amount;
+        pot += amount;
+        lastActionTime = block.timestamp;
+        currentBet = amount;
+        lastBetter = msg.sender;
+
+        emit PlayerBet(msg.sender, amount);
+        nextPlayer();
+    }
+
+    function call() external checkTimeout {
+        require(players[currentPlayer] == msg.sender, "Not your turn");
+        require(playerInfo[msg.sender].isActive, "Not an active player");
+        require(gameState == GameState.Betting, "Not betting phase");
+        require(msg.sender != lastBetter, "Already last better");
+        uint256 amount = currentBet - playerInfo[msg.sender].betAmount;
+        require(amount <= balances[msg.sender], "Insufficient balance");
+
+        if (amount + playerInfo[msg.sender].betAmount >= balances[msg.sender]) {
+            createSidePot(msg.sender);
+        }
+
+        playerInfo[msg.sender].betAmount += amount;
+        balances[msg.sender] -= amount;
+        pot += amount;
+        lastActionTime = block.timestamp;
+
+        emit PlayerBet(msg.sender, amount);
+        nextPlayer();
+    }
+
+    function fold() external checkTimeout {
+        require(players[currentPlayer] == msg.sender, "Not your turn");
+        require(playerInfo[msg.sender].isActive, "Not an active player");
+        require(gameState == GameState.Betting, "Not betting phase");
+
+        playerInfo[msg.sender].isActive = false;
+        nextBettingRound();
+    }
+
+    function check() external checkTimeout {
+        require(players[currentPlayer] == msg.sender, "Not your turn");
+        require(playerInfo[msg.sender].isActive, "Not an active player");
+        require(gameState == GameState.Betting, "Not betting phase");
+        require(currentBet == 0, "Cannot check after a bet");
+
+        nextBettingRound();
+    }
+
+    function nextPlayer() private {
+        currentPlayer = (currentPlayer + 1) % 2;
+    }
+
+    function nextBettingRound() external checkTimeout {
+        require(players[currentPlayer] == msg.sender, "Not your turn");
+        require(gameState == GameState.Betting, "Not betting phase");
+
+        if(playerInfo[players[0]].isActive == false && playerInfo[players[1]].isActive == true){
+            endGame(players[1]);
+        }
+        else if(playerInfo[players[1]].isActive == false && playerInfo[players[0]].isActive == true){
+            endGame(players[0]);
+        }
+
+        if (currentBettingRound == BettingRound.PreFlop) {
+            communityCards.push(deck[deckIndex++]);
+            communityCards.push(deck[deckIndex++]);
+            communityCards.push(deck[deckIndex++]);
+            currentBettingRound = BettingRound.Flop;
+        } else if (currentBettingRound == BettingRound.Flop) {
+            communityCards.push(deck[deckIndex++]);
+            currentBettingRound = BettingRound.Turn;
+        } else if (currentBettingRound == BettingRound.Turn) {
+            communityCards.push(deck[deckIndex++]);
+            currentBettingRound = BettingRound.River;
+        } else {
+            gameState = GameState.Reveal;
+            revealHands();
+        }
+
+        currentBet = 0;
+        lastBetter = address(0);
+        currentPlayer = 0;
+    }
+
+    function revealSeed(uint256 seed) external {
+        require(gameState == GameState.Betting, "Not betting phase");
+        require(playerInfo[msg.sender].seed == 0, "Seed already revealed");
+        playerInfo[msg.sender].seed = seed;
+        emit PlayerRevealed(msg.sender, playerInfo[msg.sender].hand);
+    }
+
+    function revealHands() private {
+        require(gameState == GameState.Reveal, "Not reveal phase");
+
+        for (uint8 i = 0; i < 2; i++) {
+            require(playerInfo[players[i]].seed != 0, "Seed not revealed");
+            playerInfo[players[i]].hand = generateHand(playerInfo[players[i]].seed);
+            emit PlayerRevealed(players[i], playerInfo[players[i]].hand);
+        }
+        determineWinner();
+    }
+
+    function generateHand(uint256 seed) private pure returns (uint8[] memory) {
+        uint8[] memory hand = new uint8[](2);
+        hand[0] = uint8(seed % 52);
+        hand[1] = uint8((seed / 52) % 52);
+
+        if (hand[0] == hand[1]) {
+            hand[1] = uint8((seed + 1) % 52);
+        }
+
+        return hand;
+    }
+
+    function createSidePot(address player) private {
+        uint256 amount = balances[player] + playerInfo[player].betAmount;
+        SidePot memory sidePot;
+        sidePot.players.push(player);
+        sidePot.amount = amount;
+        sidePots.push(sidePot);
+
+        pot -= amount;
+        balances[player] = 0;
+        playerInfo[player].betAmount = 0;
+    }
+
+    function determineWinner() public checkTimeout {
+        require(gameState == GameState.Reveal, "Not reveal phase");
+
+        address winner = address(0);
+        uint256 bestScore = 0;
+        uint8 activePlayers = 0;
+
+        for (uint8 i = 0; i < 2; i++) {
+            if (playerInfo[players[i]].isActive) {
+                activePlayers++;
+                uint8[7] memory hand = new uint8[](7);
+                hand[0] = playerInfo[players[i]].hand[0];
+                hand[1] = playerInfo[players[i]].hand[1];
+                for (uint8 j = 0; j < communityCards.length; j++) {
+                    hand[j + 2] = communityCards[j];
+                }
+                uint256 score = evaluateHand(hand);
+                if (score > bestScore) {
+                    bestScore = score;
+                    winner = players[i];
+                }
+            }
+        }
+
+        require(activePlayers > 0, "No active players");
+
+        if (activePlayers == 1) {
+            for (uint8 i = 0; i < 2; i++) {
+                if (playerInfo[players[i]].isActive) {
+                    winner = players[i];
+                    break;
+                }
+            }
+        }
+
+        payable(winner).transfer(pot);
+
+        for (uint256 i = 0; i < sidePots.length; i++) {
+            address sidePotWinner = determineSidePotWinner(sidePots[i].players);
+            payable(sidePotWinner).transfer(sidePots[i].amount);
+        }
+
+        endGame(winner);
+    }
+
+    function determineSidePotWinner(address[] memory players) private view returns (address) {
+        address winner = address(0);
+        uint256 bestScore = 0;
+
+        for (uint256 i = 0; i < players.length; i++) {
+            uint8[7] memory hand = new uint8[](7);
+            hand[0] = playerInfo[players[i]].hand[0];
+            hand[1] = playerInfo[players[i]].hand[1];
+            for (uint8 j = 0; j < communityCards.length; j++) {
+                hand[j + 2] = communityCards[j];
+            }
+            uint256 score = evaluateHand(hand);
+            if (score > bestScore) {
+                bestScore = score;
+                winner = players[i];
+            }
+        }
+
+        return winner;
+    }
+
+    function getCardValue(uint8 card) private pure returns (uint8) {
+        return card >> 2;
+    }
+
+    function getCardSuit(uint8 card) private pure returns (uint8) {
+        return card & 3;
+    }
+
+    function evaluateHand(uint8[7] memory hand) private pure returns (uint256) {
+        uint8[] memory values = new uint8[](7);
+        uint8[] memory suits = new uint8[](7);
+
+        for (uint8 i = 0; i < 7; i++) {
+            values[i] = getCardValue(hand[i]);
+            suits[i] = getCardSuit(hand[i]);
+        }
+
+        (uint256 score, uint8[] memory kickers) = checkRoyalFlush(values, suits);
+        if (score > 0) return score;
+
+        (score, kickers) = checkStraightFlush(values, suits);
+        if (score > 0) return score;
+
+        (score, kickers) = checkFourOfAKind(values);
+        if (score > 0) return score;
+
+        (score, kickers) = checkFullHouse(values);
+        if (score > 0) return score;
+
+        (score, kickers) = checkFlush(values, suits);
+        if (score > 0) return score;
+
+        (score, kickers) = checkStraight(values);
+        if (score > 0) return score;
+
+        (score, kickers) = checkThreeOfAKind(values);
+        if (score > 0) return score;
+
+        (score, kickers) = checkTwoPair(values);
+        if (score > 0) return score;
+
+        (score, kickers) = checkPair(values);
+        if (score > 0) return score;
+
+        return checkHighCard(values);
+    }
+
+    function checkRoyalFlush(uint8[] memory values, uint8[] memory suits) private pure returns (uint256, uint8[] memory) {
+        uint8[] memory royalFlushValues = new uint8[](5);
+        royalFlushValues[0] = 8;
+        royalFlushValues[1] = 9;
+        royalFlushValues[2] = 10;
+        royalFlushValues[3] = 11;
+        royalFlushValues[4] = 12;
+
+        for (uint8 suit = 0; suit < 4; suit++) {
+            uint8 matchCount = 0;
+            for (uint8 i = 0; i < 5; i++) {
+                for (uint8 j = 0; j < 7; j++) {
+                    if (values[j] == royalFlushValues[i] && suits[j] == suit) {
+                        matchCount++;
+                        break;
+                    }
+                }
+            }
+            if (matchCount == 5) {
+                return (1000, new uint8[](0));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkStraightFlush(uint8[] memory values, uint8[] memory suits) private pure returns (uint256, uint8[] memory) {
+        for (uint8 suit = 0; suit < 4; suit++) {
+            uint8[] memory suitValues = new uint8[](7);
+            uint8 suitCount = 0;
+            for (uint8 i = 0; i < 7; i++) {
+                if (suits[i] == suit) {
+                    suitValues[suitCount++] = values[i];
+                }
+            }
+            if (suitCount >= 5) {
+                sortValues(suitValues);
+                for (uint8 i = 0; i <= suitCount - 5; i++) {
+                    if (suitValues[i + 4] - suitValues[i] == 4) {
+                        return (900 + suitValues[i + 4], new uint8[](0));
+                    }
+                }
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkFourOfAKind(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        uint8[] memory counts = new uint8[](13);
+        for (uint8 i = 0; i < 7; i++) {
+            counts[values[i]]++;
+        }
+        for (uint8 i = 0; i < 13; i++) {
+            if (counts[i] == 4) {
+                uint8 kicker = findKicker(values, i);
+                return (800 + i, new uint8[](kicker));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkFullHouse(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        uint8 threeValue = findNOfAKind(values, 3);
+        if (threeValue > 0) {
+            uint8 pairValue = findNOfAKind(values, 2, threeValue);
+            if (pairValue > 0) {
+                return (700 + threeValue, new uint8[](pairValue));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkFlush(uint8[] memory values, uint8[] memory suits) private pure returns (uint256, uint8[] memory) {
+        for (uint8 suit = 0; suit < 4; suit++) {
+            uint8[] memory suitValues = new uint8[](7);
+            uint8 suitCount = 0;
+            for (uint8 i = 0; i < 7; i++) {
+                if (suits[i] == suit) {
+                    suitValues[suitCount++] = values[i];
+                }
+            }
+            if (suitCount >= 5) {
+                sortValues(suitValues);
+                return (600 + suitValues[suitCount - 1], new uint8[](0));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkStraight(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        sortValues(values);
+        for (uint8 i = 0; i <= 3; i++) {
+            if (values[i + 4] - values[i] == 4) {
+                return (500 + values[i + 4], new uint8[](0));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkThreeOfAKind(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        uint8 threeValue = findNOfAKind(values, 3);
+        if (threeValue > 0) {
+            uint8 kicker1 = findKicker(values, threeValue);
+            uint8 kicker2 = findKicker(values, threeValue, kicker1);
+            return (400 + threeValue, new uint8[](kicker1, kicker2));
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkTwoPair(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        uint8 pair1 = findNOfAKind(values, 2);
+        if (pair1 > 0) {
+            uint8 pair2 = findNOfAKind(values, 2, pair1);
+            if (pair2 > 0) {
+                uint8 kicker = findKicker(values, pair1, pair2);
+                return (300 + pair1, new uint8[](pair2, kicker));
+            }
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkPair(uint8[] memory values) private pure returns (uint256, uint8[] memory) {
+        uint8 pairValue = findNOfAKind(values, 2);
+        if (pairValue > 0) {
+            uint8 kicker1 = findKicker(values, pairValue);
+            uint8 kicker2 = findKicker(values, pairValue, kicker1);
+            uint8 kicker3 = findKicker(values, pairValue, kicker1, kicker2);
+            return (200 + pairValue, new uint8[](kicker1, kicker2, kicker3));
+        }
+        return (0, new uint8[](0));
+    }
+
+    function checkHighCard(uint8[] memory values) private pure returns (uint256) {
+        sortValues(values);
+        return values[6];
+    }
+
+    function findNOfAKind(uint8[] memory values, uint8 n, uint8 exclude1, uint8 exclude2) private pure returns (uint8) {
+        uint8[] memory counts = new uint8[](13);
+        for (uint8 i = 0; i < 7; i++) {
+            if (values[i] != exclude1 && values[i] != exclude2) {
+                counts[values[i]]++;
+            }
+        }
+        for (uint8 i = 0; i < 13; i++) {
+            if (counts[i] == n) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    function findKicker(uint8[] memory values, uint8 exclude1, uint8 exclude2, uint8 exclude3) private pure returns (uint8) {
+        uint8 kicker = 0;
+        for (uint8 i = 0; i < 7; i++) {
+            if (values[i] != exclude1 && values[i] != exclude2 && values[i] != exclude3 && values[i] > kicker) {
+                kicker = values[i];
+            }
+        }
+        return kicker;
+    }
+
+    function sortValues(uint8[] memory values) private pure {
+        for (uint8 i = 0; i < values.length - 1; i++) {
+            for (uint8 j = i + 1; j < values.length; j++) {
+                if (values[i] > values[j]) {
+                    uint8 temp = values[i];
+                    values[i] = values[j];
+                    values[j] = temp;
+                }
+            }
+        }
+    }
+
+    function endGame(address winner) private {
+        uint256 fee = (pot * 1) / 100;
+        uint256 payout = pot - fee;
+        payable(feeReceiver).transfer(fee);
+        payable(winner).transfer(payout);
+
+        emit GameEnded(winner, payout);
+        nextHand();
+    }
+
+    function nextHand() private {
+        currentPlayer = (currentPlayer + 1) % 2;
+        resetGame();
+        shuffleDeck();
+        dealCards();
+        gameState = GameState.Betting;
+    }
+}
